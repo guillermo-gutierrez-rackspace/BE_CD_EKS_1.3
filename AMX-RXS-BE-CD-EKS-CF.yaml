@@ -1,0 +1,872 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "
+  Stack con pipeline de automatización de despligue de solucion basada en manifiestos kubernetes.
+  El pipeline considera los siguientes escenarios de despliegue:
+  - Despliegue inicial. Todos los manifiestos kubernetes
+  - Despliegue continuo. Solo los manifiestos ingress, service y deployment.
+"
+
+Parameters:
+# General purpose
+  AppPrefix:
+    Type: String
+    Description: "Prefijo del aplicativo de acuerdo a la nomenclatura de AMX en letras mayusculas (ej. AMX-PPL-CC)"
+  AppPrefixLower:
+    Type: String
+    Description: "Prefijo del aplicativo de acuerdo a la nomenclatura de AMX en letras minusculas (ej. amx-ppl-cc)"
+  EnvironmentName:
+    Type: String
+    Description: "Clave del ambiente donde se esta haciendo el despliegue en mayusculas (de, q, pd)"
+    AllowedValues:
+      - "pd"
+      - "de"
+      - "q"
+
+  RepoK8sConnectionArn:
+    Type: String
+    Description: "ARN de la conexion al repositorio Git a traves del servicio de AWS CodeStar. Se puede ubicar en la consola AWS / CodePipeline / Settings / Connections. (ej. arn:aws:codestar-connections:us-east-1:983406763236:connection/26298fdb-1dd8-4a15-8e84-8b22f15dafec)"
+  RepoK8sName:
+    Type: String
+    Description: "Nombre del repositorio Git donde se hospeda el codigo fuente de la aplicacion. El formato es Cuenta_Git/Nombre_de_repositorio"
+  RepoK8sBranchName:
+    Type: String
+    Description: "Ramal dentro del repositorio Git donde se hospeda el codigo fuente de la aplicacion. Tipicamente esta alineado al nombre del ambiente donde se desplegara la solucion. (ej. develop, qa, prod)"
+  RepoK8sDirName:
+    Type: String
+    Description: "Carpeta dentro del repositorio Git donde se hospeda el codigo fuente de la aplicacion. (ej. k8s)"
+
+  RepoCdConnectionArn:
+    Type: String
+    Description: "ARN de la conexion al repositorio Git a traves del servicio de AWS CodeStar. Se puede ubicar en la consola AWS / CodePipeline / Settings / Connections. (ej. arn:aws:codestar-connections:us-east-1:983406763236:connection/26298fdb-1dd8-4a15-8e84-8b22f15dafec)"
+  RepoCdName:
+    Type: String
+    Description: "Nombre del repositorio Git donde se hospeda el codigo del CD Pipeline Backend. El formato es Cuenta_Git/Nombre_de_repositorio"
+  RepoCdBranchName:
+    Type: String
+    Description: "Ramal dentro del repositorio Git donde se hospeda el codigo del CD Pipeline Backend. Tipicamente esta alineado al nombre del ambiente donde se desplegara la solucion. (ej. develop, qq, prod)"
+  RepoBsDirName:
+    Type: String
+    Description: "Carpeta dentro del repositorio Git donde se hospedan los buildspecs del CD Pipeline Backend. (ej. buildspecs)"
+
+  EmailNotification:
+    Type: String
+    Description: "Cuenta de correo electronico de quien estara recibiendo las notificaciones de error y aprobacion manual dentro del pipeline."
+  ArnCodeBuildCMK:
+    Type: String
+    Description: "ARN de la clave administrada por el cliente (CMK) para cifrar los artefactos del pipeline."
+  EksClusterName:
+    Type: String
+    Description: "Nombre del cluster EKS. Habitualmente esta conformado por ${AppPrefix}-${EnvironmentName}. Se puede ubicar en Consola AWS / EKS / Clusters / Cluster name"
+  EksNameSpace:
+    Type: String
+    Description: "Nombre del namespace Kubernetes asociado al cluster EKS. Ej. amx-pp-cc-des-ns"
+  EksFargateProfile:
+    Type: String
+    Description: "Nombre del perfil de fargate asociado al cluster EKS. Ej. amx-ppl-cc-des-fargate."
+  OidcProviderId:
+    Type: String
+    Description: "Identificador del proveedor de identidada OIDS. Se puede ubicar en AWS Console / EKS / <Nombre del Cluster> / OpenID Connect provide URL, excluyendo el prefijo https://"
+  EcrRepoURI:
+    Type: String
+    Description: "URI del repositorio ECR de donde se hara la descarga de la imagen Docker. Se puede ubicar en Consola AWS / ECR / Repository name / URI"
+  LogGroupApp:
+    Type: String
+    Description: "Nombre del LogGroup de CloudWatch a donde se reportaran los eventos del aplicativo."
+  CidrPortalInterno:
+    Type: String
+    Description: "CIDR del Portal Interno con la siguiente nomenclatura (A.B.C.D/32). El CIDR será autorizado en el Security Group del Load Balancer para que puedan enviar peticiones."
+  ArnCertificate:
+    Type: String
+    Description: "ARN del certificado digital asociado a la puerta de enlace del ALB. Se puede ubicar en Consola AWS / ACM / List certificates / Certificate ID / ARN"
+  ServiceName:
+    Type: String
+    Description: "Nombre del servicio web en minusculas (ej. datossat, paperless, etc...)"
+  ManualApproval:
+    Type: String
+    Description: "Habilitar aprobacion manual entre etapas del pipeline."
+    AllowedValues:
+      - "Si"
+      - "No"
+
+Conditions:
+
+  # Condicion que permite habilitar/deshabilitar las aprobaciones manuales del pipeline
+  WithManualApproval: !Equals [!Ref ManualApproval, Si]
+
+Resources:
+
+  # CodeBuild Permissions
+
+  BuildBlueGreenRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AppPrefix}-${EnvironmentName}-cd-rol-cb-build-eks-${ServiceName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/service-role/"
+      MaxSessionDuration: 18000
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy
+
+  DeployBlueGreenRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AppPrefix}-${EnvironmentName}-cd-rol-cb-deploy-eks-${ServiceName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      MaxSessionDuration: 18000
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy
+
+  BuildBlueGreenPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${AppPrefix}-${EnvironmentName}-cd-pol-cb-eks-${ServiceName}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppPrefix}*:*"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+              - "logs:DeleteLogGroup"
+              - "logs:GetEvents"
+              - "logs:GetLogEvents"
+              - "logs:DescribeLogStreams"
+          - Effect: "Allow"
+            Resource:
+              - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${AppPrefix}*"
+            Action:
+              - "codebuild:CreateReportGroup"
+              - "codebuild:CreateReport"
+              - "codebuild:UpdateReport"
+              - "codebuild:BatchPutTestCases"
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeDhcpOptions
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVpcs
+              - ec2:CreateNetworkInterfacePermission
+              - ec2:CreateSecurityGroup
+              - ec2:CreateTags
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:DeleteSecurityGroup
+          - Effect: Allow
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/amx-app-de-FargatePodExecutionRole"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/eks-fargate.amazonaws.com/AWSServiceRoleForAmazonEKSForFargate"
+            Action:
+              - iam:PassRole
+              - iam:GetRole
+          - Effect: Allow
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/${AppPrefix}-${EnvironmentName}-cd-rol-cb-deploy-eks-${ServiceName}"
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Action:
+              - eks:DescribeCluster
+              - eks:ListFargateProfiles
+              - eks:CreateFargateProfile
+            Resource:
+              - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${AppPrefix}*"
+          - Effect: Allow
+            Action:
+              - "cloudformation:ListStacks"
+              - "cloudformation:ListExports"
+            Resource:
+              - '*'
+          - Effect: "Allow"
+            Resource: !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*"
+            Action:
+              - "cloudwatch:PutMetricAlarm"
+              - "cloudwatch:DeleteAlarms"
+          - Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource:
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AppPrefix}-${EnvironmentName}-CD-CB-Errors-EKS-${ServiceName}"
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AppPrefix}-${EnvironmentName}-CD-CB-MA-EKS-${ServiceName}"
+          - Effect: "Allow"
+            Action:
+              - 's3:ReplicateObject'
+              - 's3:PutObject'
+              - 's3:GetObjectAcl'
+              - 's3:GetObject'
+              - 's3:ReplicateTags'
+              - 's3:PutObjectTagging'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub "arn:aws:s3:::${AppPrefixLower}*"
+              - !Sub "arn:aws:s3:::${AppPrefixLower}*/*"
+          - Effect: "Allow"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey"
+            Resource:
+              - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+      Roles:
+        - !Ref BuildBlueGreenRole
+        - !Ref DeployBlueGreenRole
+
+  ## Rol de Permisos para el pipeline
+  ##
+  CdPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppPrefix}-${EnvironmentName}-cd-rol-cp-eks-${ServiceName}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSCodeStarFullAccess"
+        - "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser"
+
+  ## Politicas para la ejecucion del pipeline
+  ##
+  CdCodePipelineServicePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AppPrefix}-${EnvironmentName}-cd-pol-cp-eks-${ServiceName}"
+      Roles:
+        - !Ref CdPipelineRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppPrefix}*:*"
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+              - codebuild:StopBuild
+            Resource:
+              - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AppPrefix}*"
+          - Effect: Allow
+            Action:
+              - s3:ReplicateObject
+              - s3:PutObject
+              - s3:GetObjectAcl
+              - s3:GetObject
+              - s3:ReplicateTags
+              - s3:PutObjectTagging
+              - s3:DeleteObject
+            Resource:
+              - !Sub "arn:aws:s3:::${AppPrefixLower}*"
+              - !Sub "arn:aws:s3:::${AppPrefixLower}*/*"
+          - Effect: Allow
+            Action:
+              - codestar-connections:CreateConnection
+              - codestar-connections:DeleteConnection
+              - codestar-connections:UseConnection
+              - codestar-connections:GetConnection
+              - codestar-connections:ListConnections
+              - codestar-connections:TagResource
+              - codestar-connections:ListTagsForResource
+              - codestar-connections:UntagResource
+              - codestar-connections:ListConnections
+            Resource:
+              - !Ref RepoK8sConnectionArn
+              - !Ref RepoCdConnectionArn
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AppPrefix}-${EnvironmentName}-CD-CB-Errors-EKS-${ServiceName}"
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AppPrefix}-${EnvironmentName}-CD-CB-MA-EKS-${ServiceName}"
+          - Effect: "Allow"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+
+  ## Registro del rol de despliegue blue/green para interaccione
+  ## con el cluster EKS a traves de kubectl.
+  RegisterCodeBuildIamRole:
+    Type: Custom::RegisterCodeBuildIamRole
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-ConfigManagerArn"
+      CbIamRoleArn: !GetAtt DeployBlueGreenRole.Arn
+
+
+  # Application Service Account Permissions (Role)
+
+  # Políticas administradas requeridas para el cluster de eks
+  CloudWatchWriteAccess:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Política que permite la escritura de logs desde el aplicativo alojado en eks
+      ManagedPolicyName: !Sub "${AppPrefix}-${EnvironmentName}-iam-p-cwtch-write-${ServiceName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:DescribeLogGroups'
+              - 'logs:DescribeLogStreams'
+              - 'logs:CreateLogGroup'
+
+            Resource:
+#              - !Sub "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*"
+              - !Sub "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:${AppPrefix}*"
+          - Effect: Allow
+            Action:
+              - 'logs:PutLogEvents'
+            Resource:
+#              - !Sub "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*:log-stream:*"
+              - !Sub "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:${AppPrefix}*:log-stream:*"
+
+  S3ReadWriteAccess:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Política que permite la lectura y escritura de archivos desde el aplicativo alojado en eks a buckets de s3
+      ManagedPolicyName: !Sub "${AppPrefix}-${EnvironmentName}-iam-p-s3-read-write-${ServiceName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:ReplicateObject'
+              - 's3:PutObject'
+              - 's3:GetObjectAcl'
+              - 's3:GetObject'
+              - 's3:ReplicateTags'
+              - 's3:PutObjectTagging'
+              - 's3:DeleteObject'
+
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::*/*"
+
+  SMKMSReadAccess:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Política que permite la lectura de secretos y uso de kms desde el aplicativo alojado en eks
+      ManagedPolicyName: !Sub "${AppPrefix}-${EnvironmentName}-iam-p-sm-kms-read-${ServiceName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'secretsmanager:GetResourcePolicy'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:DescribeSecret'
+              - 'secretsmanager:ListSecretVersionIds'
+              - 'secretsmanager:TagResource'
+              - 'kms:GetParametersForImport'
+              - 'kms:GetPublicKey'
+              - 'kms:Decrypt'
+              - 'kms:GetKeyRotationStatus'
+              - 'kms:GetKeyPolicy'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource:
+              - !Sub "arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:*"
+              - !Sub "arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*"
+
+  # Rol AWS asociado al serviceaccount en kubernetes que utilizaran los pods del deployment.
+  CdRoleForServiceAccount:
+    # Politicas administradas a ser incluidas dentro del rol del ServiceAccount.
+    DependsOn:
+      - CloudWatchWriteAccess
+      - S3ReadWriteAccess
+      - SMKMSReadAccess
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AppPrefix}-${EnvironmentName}-sa-${ServiceName}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                '${OidcProviderId}:aud': sts.amazonaws.com
+                '${OidcProviderId}:sub': !Sub 'system:serviceaccount:${AppPrefix}-${EnvironmentName}-ns-${ServiceName}:${AppPrefix}-${EnvironmentName}-sa-${ServiceName}'
+            Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${OidcProviderId}'
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/${AppPrefix}-${EnvironmentName}-iam-p-cwtch-write-${ServiceName}'
+        - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/${AppPrefix}-${EnvironmentName}-iam-p-s3-read-write-${ServiceName}'
+        - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/${AppPrefix}-${EnvironmentName}-iam-p-sm-kms-read-${ServiceName}'
+        - 'arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess'
+        - 'arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess'
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+
+  ## SNS Topics
+
+  ## Topico SNS para notificacion de eventos de fallo en alguna de
+  ## las etapas de pipeline
+  ##
+  snsPipelinesNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AppPrefix}-${EnvironmentName}-CD-CB-Errors-EKS-${ServiceName}"
+      FifoTopic: false
+      TopicName: !Sub "${AppPrefix}-${EnvironmentName}-CD-CB-Errors-EKS-${ServiceName}"
+      KmsMasterKeyId: !Ref ArnCodeBuildCMK
+
+  ## Suscripcion al topico de notificacion de eventos de fallo en
+  ## alguna de las etapasd el pipeline
+  snsPipelineSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref EmailNotification
+      Protocol: "email"
+      TopicArn: !Ref snsPipelinesNotification
+
+  EventBridgeToToSnsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref snsPipelinesNotification
+      Topics:
+        - !Ref snsPipelinesNotification
+
+  ## Topico SNS para notificacion de eventos aprobacion manual
+  ##
+  snsApprovalNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AppPrefix}-${EnvironmentName}-CD-CB-MA-EKS-${ServiceName}"
+      FifoTopic: false
+      TopicName: !Sub "${AppPrefix}-${EnvironmentName}-CD-CB-MA-EKS-${ServiceName}"
+      KmsMasterKeyId: !Ref ArnCodeBuildCMK
+
+  ## Suscripcion al topico de notificacion de eventos de aprobacion
+  ## manual
+  snsApprovalSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref EmailNotification
+      Protocol: "email"
+      TopicArn: !Ref snsApprovalNotification
+
+  ## Log group para las distintas etapas del pipeline
+  ##
+  CdEksLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${AppPrefix}-${EnvironmentName}-be-cd-eks"
+      RetentionInDays: 90
+      KmsKeyId: !Ref ArnCodeBuildCMK
+
+  # CodeBuild Projects
+
+  ## Estapa de creacion de perfil fargate
+  ##
+  FargateProfileStage:
+    # Politicas necesarias para la realizacion de las acciones en codebuild
+    DependsOn:
+      - BuildBlueGreenPolicy
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AppPrefix}-${EnvironmentName}-CI-CB-FARGATE-${ServiceName}"
+      Description: "Deploy Fargate Profile Stage"
+      EncryptionKey: !Ref ArnCodeBuildCMK
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0"
+        PrivilegedMode: yes
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: APP_PREFIX
+            Value: !Ref AppPrefix
+          - Name: ENVIRONMENT 
+            Value: !Ref EnvironmentName
+          - Name: CLUSTER_NAME
+            Value: !Ref EksClusterName
+          - Name: EKS_FARGATE_PROFILE
+            Value: !Ref EksFargateProfile
+          - Name: EKS_NAMESPACE
+            Value: !Ref EksNameSpace
+          - Name: SUBNET1
+            Value:
+              Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-1"
+          - Name: SUBNET2
+            Value:
+              Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-2"
+      ServiceRole: !GetAtt BuildBlueGreenRole.Arn
+      Source:
+        BuildSpec: 'buildspecs/fargate-spec.yml'
+        Type: "CODEPIPELINE"
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CdEksLogGroup
+          StreamName: "fargateprofile-stage"
+          Status: ENABLED
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-NodeSecurityGroupId"
+        Subnets:
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-1"
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-2"
+        VpcId:
+          Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-VpcId"
+
+  ## Etapa de creacion del ambiente green (nueva version).
+  ##
+  GreenBuildStage:
+    # Politicas necesarias para la realizacion de las acciones en codebuild
+    DependsOn:
+      - BuildBlueGreenPolicy
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AppPrefix}-${EnvironmentName}-CI-CB-GREEN-${ServiceName}"
+      Description: "Deploy Green Build Stage"
+      EncryptionKey: !Ref ArnCodeBuildCMK
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0"
+        PrivilegedMode: yes
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: APP_PREFIX
+            Value: !Ref AppPrefix
+          - Name: ENVIRONMENT 
+            Value: !Ref EnvironmentName
+          - Name: RepoK8sDirName
+            Value: !Ref RepoK8sDirName
+          - Name: CLUSTER_NAME
+            Value: !Ref EksClusterName
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+          - Name: ECR_REPO_URI
+            Value: !Ref EcrRepoURI
+          - Name: EKS_FARGATE_PROFILE
+            Value: !Ref EksFargateProfile
+          - Name: EKS_NAMESPACE
+            Value: !Ref EksNameSpace
+          - Name: APP_LOG_GROUP
+            Value: !Ref LogGroupApp
+          - Name: ARN_ACM
+            Value: !Ref ArnCertificate
+          - Name: EKS_ROLE_ARN
+            Value: !GetAtt DeployBlueGreenRole.Arn
+          - Name: CIDR_PORTAL_INTERNO
+            Value: !Ref CidrPortalInterno
+          - Name: VPC_ID
+            Value:
+              Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-VpcId"
+          - Name: SUBNET1
+            Value:
+              Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-1"
+          - Name: SUBNET2
+            Value:
+              Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-2"
+      ServiceRole: !GetAtt BuildBlueGreenRole.Arn
+      Source:
+        BuildSpec: 'buildspecs/green-spec.yml'
+        Type: "CODEPIPELINE"
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CdEksLogGroup
+          StreamName: "greenbuild-stage"
+          Status: ENABLED
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-NodeSecurityGroupId"
+        Subnets:
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-1"
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-2"
+        VpcId:
+          Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-VpcId"
+
+  ## Etapa de conmutacion de ambiente green a blue.
+  ##
+  SwapGreenBlueBuildStage:
+    # Politicas necesarias para la realizacion de las acciones en codebuild
+    DependsOn: 
+      - BuildBlueGreenPolicy
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AppPrefix}-${EnvironmentName}-CB-SWP-${ServiceName}"
+      Description: "Swap Green / Blue Build Stage"
+      EncryptionKey: !Ref ArnCodeBuildCMK
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0"
+        PrivilegedMode: yes
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: CLUSTER_NAME
+            Value: !Ref EksClusterName
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+          - Name: ECR_REPO_URI
+            Value: !Ref EcrRepoURI
+          - Name: EKS_FARGATE_PROFILE
+            Value: !Ref EksFargateProfile
+          - Name: EKS_NAMESPACE
+            Value: !Ref EksNameSpace
+          - Name: EKS_ROLE_ARN
+            Value: !GetAtt DeployBlueGreenRole.Arn
+      ServiceRole: !GetAtt BuildBlueGreenRole.Arn
+      Source:
+        BuildSpec: 'buildspecs/green-blue-spec.yml'
+        Type: "CODEPIPELINE"
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CdEksLogGroup
+          StreamName: "swapgreenblue-stage"
+          Status: ENABLED
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-NodeSecurityGroupId"
+        Subnets:
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-1"
+          - Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-Subnet-2"
+        VpcId:
+          Fn::ImportValue: !Sub "${AppPrefix}-${EnvironmentName}-EKS-VpcId"
+
+  ## Declaracion de eventos de CodeBuild para notificacion
+  ## La regla identifica eventos en el servicio de CodeBuild,
+  ## puntualmente para los eventos de FAILED y STOPPED, en la
+  ## cuenta y region en cuestion.
+  ## Para alguno de los evento descritos previamente se genera
+  ## una notificacion via correo electronico.
+  ##
+  eventsRuleCodeBuild:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Regla para notificaciones de CodeBuild Fallidos"
+      EventBusName: "default"
+      EventPattern:
+        account:
+          - !Sub "${AWS::AccountId}"
+        region:
+          - !Sub "${AWS::Region}"
+        source:
+          - "aws.codebuild"
+        detail-type:
+          - "CodeBuild Build State Change"
+        detail:
+          build-status:
+            - "STOPPED"
+            - "FAILED"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref snsPipelinesNotification
+          Id: !GetAtt snsPipelinesNotification.TopicName
+          InputTransformer:
+            InputPathsMap:
+              "build-status": "$.detail.build-status"
+              "project-name": "$.detail.project-name"
+              "build-id": "$.detail.build-id"
+            InputTemplate: |
+              "The build '<build-id>' for project '<project-name>' reached status '<build-status>'."
+
+  ## Pipeline de despliegue de solucion basada en contenedores y declarado en manifiestos kubernetes.
+  ## Etapas:
+  ## - Source
+  ##   + Manifiestos K8s
+  ##   + Artefactos CD Pipeline
+  ## - Fargate Profile
+  ## - Ambiente green
+  ## - Conmutacion green --> blue
+  ##
+  CdPipelineEks:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: !Ref "ArtifactBucket"
+      Name: !Sub "${AppPrefix}-${EnvironmentName}-CD-BE-EKS-${ServiceName}"
+      RestartExecutionOnUpdate: false
+      RoleArn: !GetAtt CdPipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: K8sSource
+              Namespace: SourceVariables
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeStarSourceConnection
+              RunOrder: 1
+              OutputArtifacts:
+                - Name: K8sSourceOutput
+              Configuration:
+                ConnectionArn: !Ref RepoK8sConnectionArn
+                FullRepositoryId: !Ref RepoK8sName
+                BranchName: !Ref RepoK8sBranchName
+
+            - Name: CDSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeStarSourceConnection
+              RunOrder: 1
+              OutputArtifacts:
+                - Name: CDSourceOutput
+              Configuration:
+                ConnectionArn: !Ref RepoCdConnectionArn
+                FullRepositoryId: !Ref RepoCdName
+                BranchName: !Ref RepoCdBranchName
+                DetectChanges: false
+
+        - Name: FargateProfileStage
+          Actions:
+            - Name: FargateProfileStage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: K8sSourceOutput
+                - Name: CDSourceOutput
+              Configuration:
+                ProjectName: !Ref FargateProfileStage
+                PrimarySource: CDSourceOutput
+              RunOrder: 1
+
+        - !If
+          - WithManualApproval
+          - Name: ManualApprovalDeployGreen
+            Actions:
+              - Name: ManualApprovalDeployGreen
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: 1
+                Configuration:
+                  NotificationArn: !GetAtt snsApprovalNotification.TopicArn
+                  CustomData: "Manual approval to deploy Green Environment"
+          - !Ref "AWS::NoValue"
+
+        - Name: DeployGreenEnv
+          Actions:
+            - Name: DeployGreenEnv
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: K8sSourceOutput
+                - Name: CDSourceOutput
+              Configuration:
+                ProjectName: !Ref GreenBuildStage
+                PrimarySource: CDSourceOutput
+              RunOrder: 1
+
+        - !If
+          - WithManualApproval
+          - Name: ManualApprovalSWAP
+            Actions:
+              - Name: ManualApprovalSWAP
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: 1
+                Configuration:
+                  NotificationArn: !GetAtt snsApprovalNotification.TopicArn
+                  CustomData: "Manual approval for SWAP Green Environment to Blue Environment"
+          - !Ref "AWS::NoValue"
+
+        - Name: SwapGreenBlueEnvs
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: K8sSourceOutput
+                - Name: CDSourceOutput
+              Configuration:
+                ProjectName: !Ref SwapGreenBlueBuildStage
+                PrimarySource: CDSourceOutput
+              RunOrder: 1
+
+  ## Bucket S3 para los aterfactos del Pipeline
+  ## - Source(s)
+  ##
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppPrefixLower}-${EnvironmentName}-cd-eks-${ServiceName}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+Outputs:
+
+  ## ARN del bucket S3 de los artefactos del pipeline
+  ##
+  BeCdArtifactBucket:
+    Description: BE CD Artifact Bucket
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub "${AppPrefix}-${EnvironmentName}-cd-eks-${ServiceName}"

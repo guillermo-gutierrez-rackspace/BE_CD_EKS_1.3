@@ -1,0 +1,139 @@
+version: 0.2
+env:
+  shell: bash
+phases:
+  install:
+    commands:
+      - echo "[INFO] Install OS dependencies"
+      - sudo apt update && sudo apt install -y jq unzip curl wget docker
+      - echo "[INFO] Install aws-cli"
+      - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+      - unzip -q awscliv2.zip && sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+      - echo "[INFO] Install kubectl"
+      - curl -LO "https://dl.k8s.io/release/v1.22.0/bin/linux/amd64/kubectl"
+      - sudo mv kubectl  /usr/local/bin && chmod +x /usr/local/bin/kubectl
+  pre_build:
+    commands:
+      - export COMMIT_HASH_APP=$(cat $CODEBUILD_SRC_DIR_K8sSourceOutput/build.json)
+      - export TAG=${COMMIT_HASH_APP}
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output=text)
+      - export KUBECONFIG=$HOME/.kube/config
+      - export IMAGE_VERSION=$ECR_REPO_URI':'$COMMIT_HASH_APP
+      - AppPrefixLower=${APP_PREFIX,,}
+      - EnvironmentLower=${ENVIRONMENT,,}
+      - env
+      - bash ./BuildGreen/load-eksconfig.sh
+      - kubectl get nodes
+      - echo "Review alb controller configuration in EKS"
+      - albContorller=$(kubectl get deployment -n kube-system aws-load-balancer-controller | grep aws-load-balancer-controller | wc -l | awk '{print $1}')
+      - |
+        if [ $albContorller -ne 1 ]
+        then
+          echo "ALB Controller not installed. Exiting..."
+          exit 1
+        fi
+  build:
+    commands:
+      - vpcId=${VPC_ID}
+      - cidrs=$(aws ec2 describe-vpcs --vpc-id $vpcId --query "Vpcs[*].CidrBlock" --output text)
+      - |
+        if [ "${CIDR_PORTAL_INTERNO}" != "" ]
+        then
+          cidrs="${cidrs},${CIDR_PORTAL_INTERNO}"
+        fi
+      - isGreenDeployed=$(kubectl get deployment/${SERVICE_NAME}-backend-green -n ${EKS_NAMESPACE} | grep -v "^NAME"| wc -l|awk '{print $NF}')
+      - isBlueDeployed=$(kubectl get deployment/${SERVICE_NAME}-backend-blue -n ${EKS_NAMESPACE} | grep -v "^NAME"| wc -l|awk '{print $NF}')
+      - |
+        if [ $isBlueDeployed -eq 0 ]
+        then
+          BLUECOLOR=blue
+        else
+          BLUE_DEPLOYMENT=$(kubectl -n ${EKS_NAMESPACE} get svc/${SERVICE_NAME}-bknd-svc-80 -o wide| grep -v "^NAME" | awk '{split($NF,a,"="); print a[2]}')
+          BLUECOLOR=$(echo ${BLUE_DEPLOYMENT} | awk -F'-' '{print $NF}')
+        fi
+      - echo "BLUECOLOR=${BLUECOLOR}"
+      - |
+        if [ $isGreenDeployed -eq 0 ]
+        then
+          GREENCOLOR=green
+        else
+          GREEN_DEPLOYMENT=$(kubectl -n ${EKS_NAMESPACE} get svc/${SERVICE_NAME}-bknd-svc-8080 -o wide| grep -v "^NAME" | awk '{split($NF,a,"="); print a[2]}')
+          GREENCOLOR=$(echo ${GREEN_DEPLOYMENT} | awk -F'-' '{print $NF}')
+        fi
+      - echo "GREENCOLOR=${GREENCOLOR}"
+      ## Namespace
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-namespace.yaml
+      ## ServiceAccount
+      - sed -i.bk 's/AWS_ACCOUNT_ID_PLACEHOLDER/'$AWS_ACCOUNT_ID'/g'    $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-serviceaccount.yaml
+      - sed -i.bk 's/APP_PREFIX_PLACEHOLDER/'${AppPrefixLower}'/g'      $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-serviceaccount.yaml
+      - sed -i.bk 's/ENVIRONMENT_PLACEHOLDER/'${EnvironmentLower}'/g'   $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-serviceaccount.yaml
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-serviceaccount.yaml
+      - sed -i.bk 's/SERVICE_NAME_PLACEHOLDER/'${SERVICE_NAME}'/g'      $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-serviceaccount.yaml
+      ####################################
+      ## Service Blue
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-blue.yaml
+      - sed -i.bk 's/SERVICENAME_PLACEHOLDER/'${SERVICE_NAME}'/g'       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-blue.yaml
+      - sed -i.bk 's/BLUECOLOR_PLACEHOLDER/'${BLUECOLOR}'/g'            $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-blue.yaml
+      ## Deployment Blue
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+      - sed -i.bk 's/CLUSTER_NAME_PLACEHOLDER/'${CLUSTER_NAME}'/g'      $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+      - sed -i.bk 's/SERVICENAME_PLACEHOLDER/'${SERVICE_NAME}'/g'       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+      - sed -i.bk 's+LOG_GROUP_PLACEHOLDER+'${APP_LOG_GROUP}'+g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+      - sed -i.bk 's+ECR_REPO_PLACEHOLDER+'${IMAGE_VERSION}'+g'         $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+      ## Ingress Blue
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+      - sed -i.bk 's/SERVICENAME_PLACEHOLDER/'${SERVICE_NAME}'/g'       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+      - sed -i.bk 's/SUBNETS_PLACEHOLDER/'${SUBNET1}','${SUBNET2}'/g'   $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+      - sed -i.bk 's+CIDR_PLACEHOLDER+'$cidrs'+g'                       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+      - sed -i.bk 's+ACM_PLACEHOLDER+'$ARN_ACM'+g'                      $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+      ####################################
+      ## Service Green
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-green.yaml
+      - sed -i.bk 's/SERVICENAME_PLACEHOLDER/'${SERVICE_NAME}'/g'       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-green.yaml
+      - sed -i.bk 's/GREENCOLOR_PLACEHOLDER/'${GREENCOLOR}'/g'          $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-green.yaml
+      ## Deployment Green
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+      - sed -i.bk 's/CLUSTER_NAME_PLACEHOLDER/'${CLUSTER_NAME}'/g'      $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+      - sed -i.bk 's/SERVICENAME_PLACEHOLDER/'${SERVICE_NAME}'/g'       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+      - sed -i.bk 's+LOG_GROUP_PLACEHOLDER+'${APP_LOG_GROUP}'+g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+      - sed -i.bk 's+ECR_REPO_PLACEHOLDER+'${IMAGE_VERSION}'+g'         $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+      ## Ingress Green
+      - sed -i.bk 's/NAMESPACE_PLACEHOLDER/'${EKS_NAMESPACE}'/g'        $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+      - sed -i.bk 's/SERVICENAME_PLACEHOLDER/'${SERVICE_NAME}'/g'       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+      - sed -i.bk 's/SUBNETS_PLACEHOLDER/'${SUBNET1}','${SUBNET2}'/g'   $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+      - sed -i.bk 's+CIDR_PLACEHOLDER+'$cidrs'+g'                       $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+      - sed -i.bk 's+ACM_PLACEHOLDER+'${ARN_ACM}'+g'                    $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+      - bash ./BuildGreen/first-deployment.sh
+#      - GREEN_DEPLOYMENT=$(kubectl -n ${EKS_NAMESPACE} get svc/${SERVICE_NAME}-bknd-svc-8080 -o wide| grep -v "^NAME" | awk '{split($NF,a,"="); print a[2]}')
+#      - COLOR=$(echo ${GREEN_DEPLOYMENT} | awk -F'-' '{print $NF}')
+      - |
+        if [ "${GREENCOLOR}" == "blue" ]
+        then
+          cat              $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+          kubectl apply -f $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-blue.yaml
+          cat              $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-blue.yaml
+          kubectl apply -f $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-blue.yaml
+          cat              $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+          kubectl apply -f $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-blue.yaml
+        fi
+      - |
+        if [ "${GREENCOLOR}" == "green" ]
+        then
+          cat              $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+          kubectl apply -f $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-ingress-green.yaml
+          cat              $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-green.yaml
+          kubectl apply -f $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-service-green.yaml
+          cat              $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+          kubectl apply -f $CODEBUILD_SRC_DIR_K8sSourceOutput/${RepoK8sDirName}/app-deployment-green.yaml
+        fi
+#        else
+#          GREEN_DEPLOYMENT=$(kubectl -n ${EKS_NAMESPACE} get svc/${SERVICE_NAME}-bknd-svc-8080 -o wide| grep -v "^NAME" | awk '{split($NF,a,"="); print a[2]}')
+#          kubectl set image deployment/$GREEN_DEPLOYMENT -n ${EKS_NAMESPACE} $GREEN_DEPLOYMENT=$ECR_REPO_URI:$TAG
+      - sleep 30
+      - kubectl get pods,deployment,ingress,service -n ${EKS_NAMESPACE}
+      - |
+        if [ ! -z $GREEN_DEPLOYMENT ]
+        then
+          kubectl describe deployment/$GREEN_DEPLOYMENT -n ${EKS_NAMESPACE}
+        fi
+
